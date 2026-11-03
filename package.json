@@ -1,0 +1,20 @@
+{
+	"name": "commandcode-mods",
+	"version": "1.0.0",
+	"description": "Command Code mods — Herdr terminal status reporting.",
+	"keywords": [
+		"cmd-mod",
+		"cmd-mod-hook",
+		"herdr"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/armedi/commandcode-mods.git"
+	},
+	"license": "MIT",
+	"commandcode": {
+		"mods": [
+			"./herdr-status.ts"
+		]
+	}
+}

@@ -1,18 +1,21 @@
 # cmd-mod-claude-agent
 
-A Command Code mod that registers a **Claude Agent** provider. It runs Claude models through
-the official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) on your local
-`claude auth login` credentials — subscription, API key, or cloud account — instead of an
-Anthropic API key wired into `providers.json`.
+A Command Code mod that exposes a **Claude Agent** group in `/model`. It writes a
+`claude-agent` provider entry into `providers.json` (the model list comes from
+`src/models.ts`) and intercepts that entry's requests in-process, running them through the
+official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) on your local
+`claude auth login` credentials — subscription, API key, or cloud account.
 
 This is the supported path: the Agent SDK is what Anthropic publishes for programmatic agents.
 No OAuth tokens are reused, no headers are spoofed, no billing headers are forged.
 
 ## How it works
 
-Command Code providers expose a `transport` seam. The built-in Copilot and ChatGPT providers
-implement `{kind: 'aisdk', buildModel}`; this mod does the same, but the model it builds is a
-`LanguageModelV3` adapter around `@anthropic-ai/claude-agent-sdk`.
+Command Code only draws extra `/model` groups from `providers.json`, and those entries use an
+HTTP wire. At startup the mod binds a loopback HTTP server on an ephemeral port, writes that
+`http://127.0.0.1:<port>/v1` URL into the entry, and serves the Anthropic Messages wire. The
+host's declarative provider calls it, and the request is translated into the
+`LanguageModelV3` adapter below and run on the Agent SDK.
 
 The adapter:
 
@@ -50,7 +53,8 @@ Reliability rules layered on top:
 - **Content passthrough.** Image blocks in tool results and image file parts (base64 or URL) in
   user messages reach the model instead of being flattened to text.
 
-Nothing re-implements Command Code's tool execution, and nothing re-implements Anthropic's API.
+Tool execution stays in Command Code; the bridge only translates the host's Anthropic-wire
+request into the SDK and its stream back.
 
 ## Requirements
 
@@ -74,17 +78,27 @@ cmd --mod /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods/claude-a
 
 `--mod` and `--model` are separate: `--mod` loads the provider, `--model` picks a model id.
 
-Pick a model in `/model` under the **Claude Agent** heading, or:
+At startup the mod registers a `claude-agent` entry in `~/.commandcode/providers.json`, which
+is the only source the host reads for extra `/model` groups. The entry is **generated state**:
+the mod owns the model list (`src/models.ts`) and rewrites `baseURL` and `models` on every
+startup, so you never maintain it by hand. It binds a loopback server on an ephemeral port and
+writes `http://127.0.0.1:<port>/v1` into the entry; requests still run through the Claude Agent
+SDK.
+
+Pick a model in `/model` under **Claude Agent (byok)**, or pass one explicitly:
 
 ```bash
 cmd --model claude-agent/claude-sonnet-5-5
 ```
 
+The Command Code Claude rows in `/model` are the plan-gated catalog entries; the
+**Claude Agent (byok)** group is this provider and is not plan-gated.
+
 ## Model ids
 
-The catalog lists ids that exist both in Command Code's built-in catalog (required for
-`--model` resolution) and on your Claude account. Newest models are exposed by the CLI only as
-aliases, so they are mapped before they reach the SDK:
+The models reuse Command Code catalog ids and are exposed as `claude-agent/<id>`. Use that
+qualified form in `/model` and `--model`; the bare catalog id stays on Command Code. Newest
+models are exposed by the CLI only as aliases, so they are mapped before they reach the SDK:
 
 | Command Code id | Claude Code id |
 | --- | --- |
@@ -107,8 +121,11 @@ per-request way to apply them.
 
 ## Known limitations
 
-- **Model resolution** only accepts ids present in the built-in catalog. Aliases that Command
-  Code reserves (`sonnet`, `opus`, `haiku`) cannot be declared directly.
+- **`providers.json` is generated state.** The host only reads extra `/model` groups from
+  `~/.commandcode/providers.json`, so the mod must write the `claude-agent` entry there. It
+  preserves every other provider and rewrites `baseURL` and `models` on every startup. The port
+  is ephemeral and loopback-only; with concurrent `cmd` processes, the last one to start owns
+  the entry for new sessions. If you uninstall the mod, remove that entry.
 - **Replay is capped** at roughly 400k characters of rendered transcript; anything beyond is
   truncated with a marker. A replay also forfeits prompt cache and any cached thinking
   signatures.

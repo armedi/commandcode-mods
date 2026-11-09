@@ -55,7 +55,7 @@ Nothing re-implements Command Code's tool execution, and nothing re-implements A
 ## Requirements
 
 - `claude` logged in on this machine (`claude auth status`).
-- Dependencies installed once from the repo root: `vp install` (or `pnpm install`).
+- Dependencies installed once from the repo root: `npm install`.
 
 ## Install
 
@@ -65,7 +65,7 @@ This mod lives in the [`commandcode-mods`](../) repo as `claude-agent/`.
 # install the whole mods repo (herdr-status + claude-agent)
 cmd mods add /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods
 
-# or use this mod where it lives, keeping node_modules next to it
+# or install just this mod (it uses the repo-root node_modules)
 cmd mods add /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods/claude-agent
 
 # or try it without installing

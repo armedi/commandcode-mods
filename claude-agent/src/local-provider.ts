@@ -4,6 +4,12 @@ import {createServer, type IncomingMessage, type Server, type ServerResponse} fr
 import {homedir} from 'node:os';
 import {dirname, join} from 'node:path';
 import type {LanguageModelV3CallOptions, LanguageModelV3FinishReason} from '@ai-sdk/provider';
+import type {
+	ContentBlockParam,
+	MessageCreateParams,
+	MessageParam,
+	Tool,
+} from '@anthropic-ai/sdk/resources/messages';
 import {createClaudeAgentModel} from './bridge.ts';
 import {MODEL_SPECS, sdkModelId} from './models.ts';
 
@@ -90,23 +96,9 @@ function textOf(content: unknown): string {
 	return '';
 }
 
-type AnthropicBlock = {
-	type?: string;
-	text?: string;
-	id?: string;
-	name?: string;
-	input?: unknown;
-	tool_use_id?: string;
-	content?: unknown;
-	is_error?: boolean;
-	source?: {type?: string; media_type?: string; data?: string; url?: string};
-};
-
-type AnthropicMessage = {role?: string; content?: string | AnthropicBlock[]};
-
 function promptFromRequest(
-	system: unknown,
-	messages: AnthropicMessage[],
+	system: MessageCreateParams['system'],
+	messages: MessageParam[],
 ): LanguageModelV3CallOptions['prompt'] {
 	const prompt: any[] = [];
 	const systemText = textOf(system);
@@ -115,7 +107,7 @@ function promptFromRequest(
 	const toolNames = new Map<string, string>();
 
 	for (const message of messages) {
-		const blocks =
+		const blocks: ContentBlockParam[] =
 			typeof message.content === 'string'
 				? [{type: 'text', text: message.content}]
 				: Array.isArray(message.content)
@@ -182,13 +174,15 @@ function promptFromRequest(
 	return prompt as LanguageModelV3CallOptions['prompt'];
 }
 
-function toolsFromRequest(tools: unknown): LanguageModelV3CallOptions['tools'] {
+function toolsFromRequest(
+	tools: MessageCreateParams['tools'],
+): LanguageModelV3CallOptions['tools'] {
 	if (!Array.isArray(tools)) return [];
 	return tools
-		.filter((tool: any) => tool && typeof tool.name === 'string' && tool.name)
-		.map((tool: any) => ({
+		.filter((tool): tool is Tool => typeof tool?.name === 'string' && 'input_schema' in tool)
+		.map(tool => ({
 			type: 'function' as const,
-			name: String(tool.name),
+			name: tool.name,
 			description: typeof tool.description === 'string' ? tool.description : '',
 			inputSchema: tool.input_schema ?? {type: 'object', properties: {}},
 		})) as LanguageModelV3CallOptions['tools'];
@@ -247,8 +241,8 @@ function completionResponse(
 async function handleMessages(request: IncomingMessage, response: ServerResponse): Promise<void> {
 	let body = '';
 	for await (const chunk of request) body += chunk;
-	const parsed = JSON.parse(body || '{}') as any;
-	const messages: AnthropicMessage[] = Array.isArray(parsed.messages) ? parsed.messages : [];
+	const parsed = (JSON.parse(body || '{}') ?? {}) as MessageCreateParams;
+	const messages: MessageParam[] = Array.isArray(parsed.messages) ? parsed.messages : [];
 	const prompt = promptFromRequest(parsed.system, messages);
 	const tools = toolsFromRequest(parsed.tools);
 	const model = String(parsed.model ?? 'claude-sonnet-5-5');

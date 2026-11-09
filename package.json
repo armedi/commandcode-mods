@@ -1,10 +1,15 @@
 {
 	"name": "commandcode-mods",
 	"version": "1.0.0",
-	"description": "Command Code mods — Herdr terminal status reporting.",
+	"private": true,
+	"type": "module",
+	"description": "Command Code mods — Claude Agent provider and Herdr terminal status reporting.",
 	"keywords": [
 		"cmd-mod",
 		"cmd-mod-hook",
+		"cmd-mod-provider",
+		"claude",
+		"agent-sdk",
 		"herdr"
 	],
 	"repository": {
@@ -12,9 +17,22 @@
 		"url": "git+https://github.com/armedi/commandcode-mods.git"
 	},
 	"license": "MIT",
+	"scripts": {
+		"typecheck": "vp check --no-fmt --no-lint"
+	},
+	"devDependencies": {
+		"@types/node": "^24.19.2",
+		"typescript": "^5.9.3",
+		"vite-plus": "1.4.0"
+	},
+	"packageManager": "pnpm@12.18.0",
+	"engines": {
+		"node": ">=22.18.0"
+	},
 	"commandcode": {
 		"mods": [
-			"./herdr-status.ts"
+			"./claude-agent/claude-agent.ts",
+			"./herdr-status/herdr-status.ts"
 		]
 	}
 }

@@ -1,0 +1,17 @@
+{
+	"name": "cmd-mod-herdr-status",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Herdr terminal status reporting mod for Command Code — publishes idle/working/blocked state over OSC 7501.",
+	"keywords": [
+		"cmd-mod",
+		"cmd-mod-hook",
+		"herdr"
+	],
+	"commandcode": {
+		"mods": [
+			"./herdr-status.ts"
+		]
+	}
+}

@@ -1,5 +1,18 @@
 import { closeSync, openSync, writeSync } from 'node:fs';
-import type { ModApi } from '@commandcode/harness';
+
+type ModHost = {
+	getSessionName?: () => string | undefined;
+	hooks: (hooks: {
+		onSessionStart?: () => void;
+		onSessionEnd?: () => void;
+		onPermissionRequest?: (request: { description?: string; toolName: string }) =>
+			| 'allow'
+			| 'deny'
+			| undefined;
+		beforeToolCall?: (call: { toolName: string; input?: any }) => unknown;
+	}) => unknown;
+	on: (event: string, handler: (event?: any) => void) => unknown;
+};
 
 const APP = 'command-code';
 const OSC = '\x1b]7501;';
@@ -32,7 +45,7 @@ function emit(state: string, extra: Record<string, string> = {}): void {
   }
 }
 
-export default function herdrStatus(cmd: ModApi): void {
+export default function herdrStatus(cmd: ModHost): void {
   if (!process.env.HC_TERMINAL_ID) return;
 
   let working = false;

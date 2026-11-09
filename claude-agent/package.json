@@ -1,0 +1,24 @@
+{
+  "name": "cmd-mod-claude-agent",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Claude Agent provider mod for Command Code (Claude Code subscription via the Claude Agent SDK)",
+  "keywords": [
+    "cmd-mod",
+    "claude",
+    "agent-sdk"
+  ],
+  "commandcode": {
+    "mods": [
+      "./claude-agent.ts"
+    ]
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "3.0.19",
+    "@anthropic-ai/claude-agent-sdk": "0.3.322",
+    "@anthropic-ai/sdk": "^0.93.0",
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "zod": "^4.0.0"
+  }
+}

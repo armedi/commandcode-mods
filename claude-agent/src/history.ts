@@ -9,12 +9,8 @@ type ToolResultPart = Extract<
 
 const MAX_REPLAY_CHARS = 400_000;
 
-function hash(value: string): string {
-	return createHash('sha256').update(value).digest('hex').slice(0, 16);
-}
-
 export function hashText(value: string): string {
-	return hash(value);
+	return createHash('sha256').update(value).digest('hex').slice(0, 16);
 }
 
 export function textOfUserMessage(message: PromptMessage): string {
@@ -25,7 +21,7 @@ export function textOfUserMessage(message: PromptMessage): string {
 		.trim();
 }
 
-export function outputText(output: ToolResultPart['output']): string {
+function outputText(output: ToolResultPart['output']): string {
 	switch (output.type) {
 		case 'text':
 		case 'error-text':
@@ -53,11 +49,11 @@ export function promptSequence(prompt: LanguageModelV3CallOptions['prompt']): st
 	const sequence: string[] = [];
 	for (const message of prompt) {
 		if (message.role === 'user') {
-			sequence.push(`u:${hash(textOfUserMessage(message))}`);
+			sequence.push(`u:${hashText(textOfUserMessage(message))}`);
 		} else if (message.role === 'tool') {
 			for (const part of message.content) {
 				if (part.type === 'tool-result') {
-					sequence.push(`t:${part.toolCallId}:${hash(outputText(part.output))}`);
+					sequence.push(`t:${part.toolCallId}:${hashText(outputText(part.output))}`);
 				}
 			}
 		}
@@ -65,7 +61,7 @@ export function promptSequence(prompt: LanguageModelV3CallOptions['prompt']): st
 	return sequence;
 }
 
-export function isPrefix(conveyed: readonly string[], incoming: readonly string[]): boolean {
+function isPrefix(conveyed: readonly string[], incoming: readonly string[]): boolean {
 	if (conveyed.length > incoming.length) return false;
 	return conveyed.every((entry, index) => entry === incoming[index]);
 }

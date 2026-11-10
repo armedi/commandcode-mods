@@ -18,7 +18,7 @@
 	},
 	"license": "MIT",
 	"scripts": {
-		"typecheck": "tsc -p herdr-status && tsc -p claude-agent"
+		"typecheck": "tsc -p ."
 	},
 	"dependencies": {
 		"@ai-sdk/provider": "3.0.19",

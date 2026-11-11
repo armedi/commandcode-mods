@@ -1,4 +1,5 @@
 import {query} from '@anthropic-ai/claude-agent-sdk/core';
+import {Queue} from './queue.ts';
 
 type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -36,11 +37,16 @@ function specsFromCli(models: readonly CliModel[]): ModelSpec[] {
 	return specs;
 }
 
-/** Ask the Claude CLI which models this account can use. */
+/**
+ * Ask the Claude CLI which models this account can use. Never sends a user turn: the prompt
+ * stream stays open and empty, so only the initialize handshake runs.
+ */
 export async function fetchCliModelSpecs(): Promise<ModelSpec[]> {
+	const input = new Queue<never>();
 	const session = query({
-		prompt: 'ready',
+		prompt: input as never,
 		options: {
+			tools: [] as never,
 			persistSession: false,
 			settingSources: [],
 			strictMcpConfig: true,
@@ -49,6 +55,7 @@ export async function fetchCliModelSpecs(): Promise<ModelSpec[]> {
 	try {
 		return specsFromCli(await session.supportedModels());
 	} finally {
+		input.close();
 		session.close();
 	}
 }

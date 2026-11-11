@@ -1,7 +1,13 @@
 import {randomUUID} from 'node:crypto';
-import {query} from '@anthropic-ai/claude-agent-sdk/core';
+import {query, type Query} from '@anthropic-ai/claude-agent-sdk/core';
 import {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js';
-import {z} from 'zod';
+import {
+	CallToolRequestSchema,
+	ErrorCode,
+	ListToolsRequestSchema,
+	McpError,
+	type Tool,
+} from '@modelcontextprotocol/sdk/types.js';
 import type {
 	LanguageModelV3,
 	LanguageModelV3CallOptions,
@@ -34,6 +40,7 @@ const MCP_PREFIX = `mcp__${MCP_SERVER}__`;
 const DEBUG = process.env.CLAUDE_AGENT_MOD_DEBUG === '1';
 const IDLE_SESSION_MS = Number(process.env.CLAUDE_AGENT_MOD_IDLE_MS ?? 2 * 60 * 60 * 1000);
 const TOOL_CALL_TIMEOUT_MS = Number(process.env.CLAUDE_AGENT_MOD_TOOL_TIMEOUT_MS ?? 10 * 60 * 1000);
+const TOOL_LIST_TIMEOUT_MS = Number(process.env.CLAUDE_AGENT_MOD_TOOL_LIST_TIMEOUT_MS ?? 10_000);
 const MAX_SESSIONS = Math.max(1, Number(process.env.CLAUDE_AGENT_MOD_MAX_SESSIONS ?? 6) || 6);
 /** How long a turn's `result` trailer may lag its last message_stop or an interrupt. */
 const TRAILER_TIMEOUT_MS = 10_000;
@@ -63,7 +70,22 @@ type CallToolResult = {
 	isError?: boolean;
 };
 
-type PendingCall = {id: string; name: string; input: string};
+type PendingCall = {id: string; name: string; input: string; offered: boolean};
+
+/** The connected server never changes; each lease may replace the catalog it reads. */
+type ToolCatalog = {
+	server: McpServer;
+	/** The host's current catalog, used for dispatch even during a refresh. */
+	tools: Map<string, Tool>;
+	/** The list currently advertised; briefly empty to acknowledge same-name changes. */
+	published: Map<string, Tool>;
+	/** Undefined until the CLI has committed the entire update (also after an abort). */
+	fingerprint: string | undefined;
+	refresh: {
+		listed: () => void;
+		fail: (error: unknown) => void;
+	} | undefined;
+};
 
 /**
  * - `streaming`: a host request holds the lease and receives the open SDK turn's events.
@@ -110,7 +132,8 @@ type Session = {
 	/** Tool calls an interrupt answered; host results for them are accepted and dropped. */
 	abortedCalls: Set<string>;
 	input: Queue<Record<string, unknown>>;
-	handle: {close: () => void; interrupt: () => Promise<unknown>} | undefined;
+	handle: Pick<Query, 'close' | 'interrupt' | 'mcpServerStatus'> | undefined;
+	mcp: ToolCatalog;
 	pending: Map<string, (result: CallToolResult) => void>;
 	results: Map<string, CallToolResult>;
 	calls: PendingCall[];
@@ -128,7 +151,7 @@ type SessionRegistry = {
 	timer?: ReturnType<typeof setInterval>;
 };
 
-const REGISTRY_VERSION = 2;
+const REGISTRY_VERSION = 3;
 
 // Kept on globalThis so a mod hot-reload re-imports this module without orphaning the
 // `claude` subprocesses owned by the previous instance.
@@ -179,43 +202,43 @@ function systemText(prompt: Prompt): string | undefined {
 	return text || undefined;
 }
 
-function sessionSignature(system: string | undefined, tools: FunctionTool[]): string {
-	const toolPart = tools
-		.map(tool => `${tool.name}:${JSON.stringify(tool.inputSchema ?? {})}`)
-		.sort()
-		.join('\u0000');
-	return hashText(`${system ?? ''}\u0000${toolPart}`);
-}
-
-function toZodShape(schema: unknown, label: string): Record<string, z.ZodTypeAny> {
-	try {
-		if (!schema || typeof schema !== 'object') return {};
-		const converted = z.fromJSONSchema(schema as never) as unknown as {shape?: Record<string, z.ZodTypeAny>};
-		const shape = converted.shape ?? {};
-		const properties = (schema as {properties?: Record<string, unknown>}).properties;
-		if (!properties || Object.keys(properties).length === 0) return shape;
-		if (Object.keys(shape).length > 0) return shape;
-		debug('schema converted to an empty shape; falling back to permissive fields', label);
-		return permissiveShape(schema as {properties: Record<string, unknown>; required?: string[]});
-	} catch (error) {
-		debug('schema conversion failed; falling back to permissive fields', label, error);
-		const properties = (schema as {properties?: Record<string, unknown>} | null)?.properties;
-		if (!properties) return {};
-		return permissiveShape(schema as {properties: Record<string, unknown>; required?: string[]});
-	}
+function sessionSignature(system: string | undefined): string {
+	return hashText(system ?? '');
 }
 
 /**
- * Last-resort shape for a JSON Schema zod cannot express: keep the field names (and whether
- * they were required) so the model still sees a usable tool signature instead of `{}`.
+ * MCP requires an object root, and this SDK's tools/list envelope requires object-valued
+ * property schemas. Otherwise retain the host schema verbatim, without compiling it.
+ * Normalization changes only those envelope constraints; arguments are never unwrapped.
  */
-function permissiveShape(schema: {properties: Record<string, unknown>; required?: string[]}): Record<string, z.ZodTypeAny> {
-	const required = new Set(schema.required ?? []);
-	const shape: Record<string, z.ZodTypeAny> = {};
-	for (const key of Object.keys(schema.properties)) {
-		shape[key] = required.has(key) ? z.any() : z.any().optional();
+function mcpInputSchema(schema: FunctionTool['inputSchema']): Tool['inputSchema'] {
+	if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+		return schema === false ? {type: 'object', not: {}} : {type: 'object'};
 	}
-	return shape;
+	const properties = schema.properties;
+	const booleanProperties = properties && Object.values(properties).some(value => typeof value === 'boolean');
+	if (schema.type === 'object' && !booleanProperties) return schema as Tool['inputSchema'];
+	return {
+		...schema,
+		type: 'object',
+		...(booleanProperties ? {
+			properties: Object.fromEntries(Object.entries(properties).map(([name, value]) => [
+				name, typeof value === 'boolean' ? {allOf: [value]} : value,
+			])),
+		} : {}),
+	} as Tool['inputSchema'];
+}
+
+function toolMap(tools: FunctionTool[]): Map<string, Tool> {
+	return new Map(tools.map(tool => [tool.name, {
+		name: tool.name,
+		description: tool.description,
+		inputSchema: mcpInputSchema(tool.inputSchema),
+	}]));
+}
+
+function toolFingerprint(tools: Map<string, Tool>): string {
+	return stableValue([...tools.values()].sort((a, b) => a.name.localeCompare(b.name)));
 }
 
 function errorResult(text: string): CallToolResult {
@@ -275,19 +298,27 @@ function sameArguments(callInput: string, args: unknown): boolean {
 	return stableValue(parsed) === stableValue(args);
 }
 
-function takeCallId(session: Session, name: string, args: unknown): Promise<string> {
-	const exact = session.calls.findIndex(call => call.name === name && sameArguments(call.input, args));
-	const index = exact >= 0 ? exact : session.calls.findIndex(call => call.name === name);
+function takeCallId(session: Session, name: string, args: unknown, deadline: number): Promise<string> {
+	const index = session.calls.findIndex(call => call.name === name && sameArguments(call.input, args));
 	if (index >= 0) return Promise.resolve(session.calls.splice(index, 1)[0]!.id);
-	return new Promise(resolve => session.callWaiters.push({name, args, resolve}));
+	return new Promise(resolve => {
+		const timer = setTimeout(() => {
+			debug('tool call id timed out', name);
+			closeSession(session, 'tool call id timed out');
+		}, Math.max(0, deadline - Date.now()));
+		timer.unref?.();
+		session.callWaiters.push({name, args, resolve: id => {
+			clearTimeout(timer);
+			resolve(id);
+		}});
+	});
 }
 
 function registerCall(session: Session, call: PendingCall): void {
 	debug('tool call', call.id, call.name);
-	const exact = session.callWaiters.findIndex(
+	const index = session.callWaiters.findIndex(
 		entry => entry.name === call.name && sameArguments(call.input, entry.args),
 	);
-	const index = exact >= 0 ? exact : session.callWaiters.findIndex(entry => entry.name === call.name);
 	if (index >= 0) {
 		const [waiter] = session.callWaiters.splice(index, 1);
 		waiter!.resolve(call.id);
@@ -296,7 +327,7 @@ function registerCall(session: Session, call: PendingCall): void {
 	session.calls.push(call);
 }
 
-function awaitToolResult(session: Session, id: string, toolName: string): Promise<CallToolResult> {
+function awaitToolResult(session: Session, id: string, toolName: string, deadline: number): Promise<CallToolResult> {
 	const buffered = session.results.get(id);
 	if (buffered) {
 		session.results.delete(id);
@@ -310,7 +341,7 @@ function awaitToolResult(session: Session, id: string, toolName: string): Promis
 			// A turn nobody is driving anymore must not keep running in the background:
 			// the next request replays the host transcript into a fresh session instead.
 			closeSession(session, 'tool call timed out');
-		}, TOOL_CALL_TIMEOUT_MS);
+		}, Math.max(0, deadline - Date.now()));
 		timer.unref?.();
 		session.pending.set(id, result => {
 			clearTimeout(timer);
@@ -328,26 +359,105 @@ function releaseToolWaiters(session: Session, text: string): void {
 	session.results.clear();
 }
 
-function buildMcpServer(tools: FunctionTool[], session: Session) {
-	const server = new McpServer({name: 'cmd-tools', version: '1.0.0'});
-	for (const tool of tools) {
-		server.registerTool(
-			tool.name,
-			{
-				description: tool.description,
-				inputSchema: toZodShape(tool.inputSchema, tool.name),
-			},
-			async (args: unknown) => {
-				if (session.closed) return errorResult(CLOSED_TEXT);
-				if (session.turn?.aborting) return errorResult(ABORTED_TEXT);
-				const id = await takeCallId(session, tool.name, args ?? {});
-				debug('mcp call', tool.name, id);
-				if (!id) return errorResult(session.closed ? CLOSED_TEXT : ABORTED_TEXT);
-				return await awaitToolResult(session, id, tool.name);
-			},
-		);
-	}
+function buildMcpServer(session: Session) {
+	const {server} = session.mcp;
+	server.server.registerCapabilities({tools: {listChanged: true}});
+	server.server.setRequestHandler(ListToolsRequestSchema, () => {
+		const catalog = session.mcp;
+		const tools = [...catalog.published.values()];
+		debug('mcp tools/list', `#${session.id}`, JSON.stringify(tools));
+		catalog.refresh?.listed();
+		return {tools};
+	});
+	// The low-level Server validates only the MCP envelope/result, never tool arguments.
+	server.server.setRequestHandler(CallToolRequestSchema, async request => {
+		const {name, arguments: args = {}} = request.params;
+		// A handler can arrive after the host has already returned an issued call's result
+		// and removed its tool. Such a call may finish; a new unknown call must fail now.
+		const issued = session.calls.some(call => call.offered && call.name === name && sameArguments(call.input, args));
+		if (!session.mcp.tools.has(name) && !issued) {
+			debug('unknown mcp tool', `#${session.id}`, name);
+			// Finding a tool is a protocol failure, not a host tool-execution isError result.
+			throw new McpError(ErrorCode.InvalidParams, `Tool ${name} is not available.`);
+		}
+		if (session.closed) return errorResult(CLOSED_TEXT);
+		if (session.turn?.aborting) return errorResult(ABORTED_TEXT);
+		const deadline = Date.now() + TOOL_CALL_TIMEOUT_MS;
+		const id = await takeCallId(session, name, args, deadline);
+		debug('mcp call', name, id, JSON.stringify(args));
+		if (session.closed) return errorResult(CLOSED_TEXT);
+		if (!id || !session.turn || session.turn.aborting) return errorResult(ABORTED_TEXT);
+		return await awaitToolResult(session, id, name, deadline);
+	});
 	return {type: 'sdk' as const, name: MCP_SERVER, instance: server};
+}
+
+/** Refresh while leased, before resolving any result that could let the CLI call the API. */
+async function updateTools(session: Session, tools: FunctionTool[], signal: AbortSignal | undefined): Promise<void> {
+	const catalog = session.mcp;
+	const next = toolMap(tools);
+	const fingerprint = toolFingerprint(next);
+	if (catalog.fingerprint === fingerprint) return;
+	const needsEmptyList = catalog.fingerprint === undefined ||
+		stableValue([...catalog.tools.keys()].sort()) === stableValue([...next.keys()].sort());
+	catalog.tools = next;
+	catalog.fingerprint = undefined;
+	debug('updating tools', `#${session.id}`, [...next.keys()]);
+	// Status exposes names, not schemas/descriptions. With unchanged names it cannot
+	// distinguish an old catalog from the new one. After an interrupted refresh the CLI's
+	// list is also unknown. Commit an empty list first in either case, then the new list;
+	// neither phase allows an API call. Dispatch still uses `tools`, so
+	// suspensions and late handlers for tools that remain available are not disconnected.
+	const publications = needsEmptyList && next.size > 0 ? [new Map<string, Tool>(), next] : [next];
+	for (const published of publications) {
+		catalog.published = published;
+		let listed!: () => void;
+		const refetched = new Promise<void>(resolve => { listed = resolve; });
+		let reject!: (error: unknown) => void;
+		const failed = new Promise<never>((_resolve, fail) => { reject = fail; });
+		const controller = new AbortController();
+		const refresh = {
+			listed,
+			fail(error: unknown) {
+				controller.abort(error);
+				listed();
+				reject(error);
+			},
+		};
+		catalog.refresh = refresh;
+		const onAbort = () => refresh.fail(abortReason(signal!));
+		signal?.addEventListener('abort', onAbort, {once: true});
+		const timer = setTimeout(() => refresh.fail(new Error(`MCP tool list was not refreshed within ${TOOL_LIST_TIMEOUT_MS}ms.`)), TOOL_LIST_TIMEOUT_MS);
+		timer.unref?.();
+		try {
+			await Promise.race([
+				(async () => {
+					await catalog.server.server.sendToolListChanged();
+					await refetched;
+					// A tools/list handler running is not an acknowledgement: the CLI must
+					// validate its response and commit the catalog before we release a result.
+					const expected = [...published.keys()].sort();
+					for (;;) {
+						controller.signal.throwIfAborted();
+						const status = (await session.handle!.mcpServerStatus()).find(server => server.name === MCP_SERVER);
+						controller.signal.throwIfAborted();
+						const offered = (status?.tools ?? []).map(tool => tool.name).sort();
+						if (status?.status === 'connected' && stableValue(offered) === stableValue(expected)) {
+							debug('tool list refreshed', `#${session.id}`, offered);
+							return;
+						}
+						await new Promise(resolve => setTimeout(resolve, 25));
+					}
+				})(),
+				failed,
+			]);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener('abort', onAbort);
+			if (catalog.refresh === refresh) catalog.refresh = undefined;
+		}
+	}
+	catalog.fingerprint = fingerprint;
 }
 
 /**
@@ -373,6 +483,7 @@ function createSession(
 	ephemeral: boolean,
 ): Session {
 	enforceSessionCap();
+	const publishedTools = toolMap(tools);
 	const session: Session = {
 		id: registry.nextId++,
 		modelId,
@@ -386,6 +497,13 @@ function createSession(
 		abortedCalls: new Set(),
 		input: new Queue(),
 		handle: undefined,
+		mcp: {
+			server: new McpServer({name: 'cmd-tools', version: '1.0.0'}),
+			tools: publishedTools,
+			published: publishedTools,
+			fingerprint: toolFingerprint(publishedTools),
+			refresh: undefined,
+		},
 		pending: new Map(),
 		results: new Map(),
 		calls: [],
@@ -396,7 +514,7 @@ function createSession(
 		closed: false,
 	};
 
-	const mcpServers = tools.length > 0 ? {[MCP_SERVER]: buildMcpServer(tools, session)} : {};
+	const mcpServers = tools.length > 0 ? {[MCP_SERVER]: buildMcpServer(session)} : undefined;
 	const abortController = new AbortController();
 
 	const handle = query({
@@ -405,7 +523,7 @@ function createSession(
 			model: modelId,
 			cwd: process.cwd(),
 			abortController,
-			mcpServers: mcpServers as never,
+			mcpServers,
 			tools: [] as never,
 			settingSources: [],
 			strictMcpConfig: true,
@@ -422,7 +540,7 @@ function createSession(
 		},
 	});
 
-	session.handle = handle as never;
+	session.handle = handle;
 	sessions.add(session);
 	debug('session created', `#${session.id}`, modelId, ephemeral ? '(ephemeral)' : '', tools.map(tool => tool.name));
 	void pumpSession(session, handle as AsyncIterable<SdkMessage>);
@@ -445,6 +563,7 @@ function closeSession(session: Session, reason: string, error?: unknown): void {
 	session.closed = true;
 	session.state = 'closed';
 	sessions.delete(session);
+	session.mcp.refresh?.fail(error ?? new Error(`Claude Agent session closed: ${reason}`));
 	clearTrailer(session);
 	const lease = session.lease;
 	session.lease = undefined;
@@ -612,7 +731,7 @@ function onStreamEvent(session: Session, lease: Lease, event: SdkMessage): void 
 				lease.tools.delete(event.index);
 				const toolName = tool.name.startsWith(MCP_PREFIX) ? tool.name.slice(MCP_PREFIX.length) : tool.name;
 				const input = tool.json || '{}';
-				registerCall(session, {id: tool.id, name: toolName, input});
+				registerCall(session, {id: tool.id, name: toolName, input, offered: session.mcp.tools.has(toolName)});
 				session.outstanding.add(tool.id);
 				lease.calls.push(tool.id);
 				send({type: 'tool-call', toolCallId: tool.id, toolName, input});
@@ -1010,17 +1129,15 @@ async function streamFor(
 	if (signal?.aborted) throw abortReason(signal);
 	const tools = (options.tools ?? []).filter(isFunctionTool);
 	const system = systemText(options.prompt);
-	const signature = sessionSignature(system, tools);
-	// Tool-free calls (titles, summaries, helpers) and /btw side questions never touch a
-	// conversation's session and close as soon as their stream ends.
-	const ephemeral = tools.length === 0 || isSideQuestion(options.prompt);
+	const signature = sessionSignature(system);
+	const sideQuestion = isSideQuestion(options.prompt);
 	const incoming = transcriptEntries(options.prompt);
 
-	if (!ephemeral) await settleDrains(sdkModelId, signature, incoming, signal);
+	if (!sideQuestion) await settleDrains(sdkModelId, signature, incoming, signal);
 	if (signal?.aborted) throw abortReason(signal);
 
 	// Nothing below awaits until the lease is taken, so no other request can claim the session.
-	if (!ephemeral) {
+	if (!sideQuestion) {
 		const found = findContinuation(sdkModelId, signature, incoming);
 		if (found === 'ambiguous') {
 			debug('several sessions continue this transcript equally; starting a new one');
@@ -1028,14 +1145,33 @@ async function streamFor(
 			// Nothing to submit and no tool call to answer (a host retry): reading events now would
 			// wait on nothing, so replay into a fresh session instead.
 			debug('nothing new for session', `#${found.session.id}`, '- replaying into a new session');
-			if (found.session.state === 'idle' && !found.session.lease) closeSession(found.session, 'superseded by a replay');
+			if (tools.length > 0 && found.session.state === 'idle' && !found.session.lease) closeSession(found.session, 'superseded by a replay');
 		} else if (found) {
-			const lease = attachLease(found.session);
-			continueSession(found.session, found.plan, options.prompt, incoming);
-			return {stream: leaseStream(found.session, lease, options)};
+			const {session, plan} = found;
+			const lease = attachLease(session);
+			// Install abort handling before the refresh barrier, not after its awaits.
+			const stream = leaseStream(session, lease, options);
+			try {
+				await updateTools(session, tools, signal);
+				if (signal?.aborted) throw abortReason(signal);
+				if (session.lease !== lease) throw new Error('The session ended while its tool list was being refreshed.');
+				continueSession(session, plan, options.prompt, incoming);
+				return {stream};
+			} catch (error) {
+				if (!signal?.aborted) {
+					debug('tool list refresh failed', `#${session.id}`, error);
+					closeSession(session, 'tool list refresh failed', error);
+				}
+				await stream.cancel(error).catch(() => {});
+				if (signal?.aborted) throw abortReason(signal);
+				throw error;
+			}
 		}
 	}
 
+	// A live conversation may remove even its last tool. Only unmatched tool-free helpers
+	// (titles, summaries, etc.) and /btw requests need an isolated, short-lived session.
+	const ephemeral = tools.length === 0 || sideQuestion;
 	const initial = initialContent(options.prompt, incoming);
 	if (!initial) throw new Error('The prompt has no user message to send to Claude.');
 	const session = createSession(sdkModelId, system, tools, signature, ephemeral);

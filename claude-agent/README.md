@@ -20,39 +20,59 @@ straight to the Agent SDK — no HTTP wire and no server.
 
 The adapter:
 
-1. Starts one long-lived Agent SDK session per Command Code thread, with the harness's system
+1. Runs each conversation in a long-lived Agent SDK session, with the harness's system
    prompt, no built-in Claude Code tools (`tools: []`), no settings sources, no CLAUDE.md, and
    `verbatimPrompts: true` so Claude Code adds none of its own per-turn context (skill lists,
-   reminders, nested memory files).
+   reminders, nested memory files). The host passes no thread id, so a request finds its
+   session by transcript (see 6).
 2. Publishes the harness's tools to the SDK as an in-process MCP server, so the model sees
    exactly the tools Command Code offered — with their real JSON schemas.
 3. Streams text, thinking, and tool calls back as AI SDK stream parts.
 4. Suspends at a tool call: the MCP handler blocks on a promise. Command Code executes the tool
    in its own loop (permissions, diffs, plan mode, MCP/mod tools all intact), sends the result
    on the next request, and the handler resolves with it, so the SDK continues its turn.
-5. Forwards token usage from the Anthropic stream events.
-6. Treats the host transcript as the source of truth. Each request's user turns and tool results
-   are fingerprinted; if the incoming transcript continues what the session already holds, only
-   the new user message is sent. If it diverges — an edited turn, a compaction, a model switch,
-   a fresh process — the session restarts and the whole visible transcript is replayed as **one**
-   message, matching OpenCode's Claude Agent provider.
+5. Forwards token usage from the Anthropic stream events of each API response.
+6. Treats the host transcript as the source of truth. Each request's user messages (including
+   image and file data), tool results (id, success or error, content), and assistant messages
+   are fingerprinted. A session records the transcript it holds, including the tool-call ids
+   and text it produced itself. A request continues the live session whose record is the
+   unique longest prefix of its transcript, and only the new user messages are sent, merged
+   into one SDK message. If no session matches, or two match equally, a new session starts:
+   with no history it gets the user messages as they are, otherwise the whole visible
+   transcript is replayed as **one** message (user images stay images), matching OpenCode's
+   Claude Agent provider. An edited turn, a compaction, or a model switch therefore costs one
+   replay; the session that no longer matches is reaped later.
 
 Reliability rules layered on top:
 
 - **Session signature.** The system prompt and the tool set (names + schemas) are part of the
-  session identity. A plan-mode switch or a changed tool list restarts the session and replays,
+  session identity. A plan-mode switch or a changed tool list starts a new session and replays,
   instead of feeding the model stale instructions.
+- **One request per session.** A request holds its session exclusively until its API response
+  ends. A tool-result request continues the same SDK turn; a session is matched for a new turn
+  only after the previous turn's `result` has arrived.
+- **Side requests stay apart.** Tool-free calls (titles, summaries, helpers) and `/btw` side
+  questions always get their own session, which closes as soon as their stream ends.
+- **Esc keeps the session.** An aborted request interrupts the SDK turn, answers suspended tool
+  calls with an error, and drains the interrupted turn; the next turn continues the same
+  session without a replay. If the interrupt fails or the turn does not end within 10 s, the
+  session is closed instead.
 - **Tool-call deadline.** A suspended tool call that never gets a result resolves with an error
   after `CLAUDE_AGENT_MOD_TOOL_TIMEOUT_MS` (default 10 min) and the session is closed, so a dead
   harness turn can never wedge later requests.
 - **Call matching by arguments.** Parallel calls of the same tool are bound to their tool_use id
   by matching the arguments the MCP handler receives against the streamed tool-call JSON, not by
   arrival order.
-- **Cleanup.** Idle sessions are swept every few minutes, anonymous one-shot sessions close at
-  the end of their turn, and `session_shutdown`, mod reload, and process exit dispose of every
-  subprocess. Session state lives on `globalThis`, so a hot reload does not orphan them.
+- **Cleanup.** Idle sessions are swept every few minutes, at most
+  `CLAUDE_AGENT_MOD_MAX_SESSIONS` sessions are kept (least recently used idle ones close
+  first; the cap is exceeded rather than closing a session in use), and `session_shutdown`,
+  mod reload, and process exit dispose of every subprocess. Session state lives on
+  `globalThis`, so a hot reload does not orphan them.
 - **Content passthrough.** Image blocks in tool results and image file parts (base64 or URL) in
-  user messages reach the model instead of being flattened to text.
+  user messages reach the model instead of being flattened to text. Text-like attachments
+  (`text/*`, JSON, XML, ...) are sent as text; other files become a note naming them.
+- **Visible failures.** An SDK failure or an API error ends the request's stream with an error
+  instead of a normal finish.
 
 Tool execution stays in Command Code; the adapter only runs the Agent SDK and hands its
 stream to the host.
@@ -111,6 +131,7 @@ timeout events to stderr. Other knobs:
 | --- | --- | --- |
 | `CLAUDE_AGENT_MOD_TOOL_TIMEOUT_MS` | `600000` | Deadline for a suspended tool call |
 | `CLAUDE_AGENT_MOD_IDLE_MS` | `7200000` | Idle time before a session is closed |
+| `CLAUDE_AGENT_MOD_MAX_SESSIONS` | `6` | Soft cap on live sessions |
 
 Requests carrying `temperature`, `topP`, `topK`, `stopSequences`, penalties, or
 `maxOutputTokens` are accepted but reported through AI SDK warnings — the Agent SDK has no
@@ -129,9 +150,9 @@ per-request way to apply them.
   `@ai-sdk/anthropic` module exposing `createAnthropic` and its model prototype. The hook is
   scoped to the sentinel `baseURL` and leaves other Anthropic models untouched; a host update
   that bundles or replaces the package can break it (the mod logs a warning).
-- **Replay is capped** at roughly 400k characters of rendered transcript; anything beyond is
-  truncated with a marker. A replay also forfeits prompt cache and any cached thinking
-  signatures.
+- **Replay is capped** at roughly 400k characters of rendered transcript. The latest user
+  request is always kept whole; the oldest middle of the conversation is dropped, with a
+  marker. A replay also forfeits prompt cache and any cached thinking signatures.
 - **Side tasks that use this provider spawn a process.** A feature model pinned to
   `claude-agent/...` (titling, compaction, one-shot helpers) starts a `claude` subprocess per
   call. It closes when the turn ends, but the spawn cost is real; pin those features to a

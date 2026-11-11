@@ -1,5 +1,5 @@
 import {randomUUID} from 'node:crypto';
-import {query, type Query} from '@anthropic-ai/claude-agent-sdk/core';
+import {query, type EffortLevel, type Query} from '@anthropic-ai/claude-agent-sdk/core';
 import {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
 	CallToolRequestSchema,
@@ -41,6 +41,8 @@ const DEBUG = process.env.CLAUDE_AGENT_MOD_DEBUG === '1';
 const IDLE_SESSION_MS = Number(process.env.CLAUDE_AGENT_MOD_IDLE_MS ?? 2 * 60 * 60 * 1000);
 const TOOL_CALL_TIMEOUT_MS = Number(process.env.CLAUDE_AGENT_MOD_TOOL_TIMEOUT_MS ?? 10 * 60 * 1000);
 const TOOL_LIST_TIMEOUT_MS = Number(process.env.CLAUDE_AGENT_MOD_TOOL_LIST_TIMEOUT_MS ?? 10_000);
+/** How long a mid-session effort change may take before it is dropped for this request. */
+const EFFORT_TIMEOUT_MS = 5000;
 const MAX_SESSIONS = Math.max(1, Number(process.env.CLAUDE_AGENT_MOD_MAX_SESSIONS ?? 6) || 6);
 /** How long a turn's `result` trailer may lag its last message_stop or an interrupt. */
 const TRAILER_TIMEOUT_MS = 10_000;
@@ -122,6 +124,8 @@ type Session = {
 	modelId: string;
 	signature: string;
 	ephemeral: boolean;
+	/** The effort the CLI session currently runs at; undefined is the model default. */
+	effort: EffortLevel | undefined;
 	state: SessionState;
 	lease: Lease | undefined;
 	turn: Turn | undefined;
@@ -132,7 +136,7 @@ type Session = {
 	/** Tool calls an interrupt answered; host results for them are accepted and dropped. */
 	abortedCalls: Set<string>;
 	input: Queue<Record<string, unknown>>;
-	handle: Pick<Query, 'close' | 'interrupt' | 'mcpServerStatus'> | undefined;
+	handle: Pick<Query, 'applyFlagSettings' | 'close' | 'interrupt' | 'mcpServerStatus'> | undefined;
 	mcp: ToolCatalog;
 	pending: Map<string, (result: CallToolResult) => void>;
 	results: Map<string, CallToolResult>;
@@ -392,6 +396,48 @@ function buildMcpServer(session: Session) {
 	return {type: 'sdk' as const, name: MCP_SERVER, instance: server};
 }
 
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
+
+/**
+ * The reasoning effort this request asks for, or undefined when it asks for none. The host
+ * sends nothing both for "no effort" and for "off", so absence means "model default", not
+ * "thinking disabled".
+ */
+function requestedEffort(options: LanguageModelV3CallOptions): EffortLevel | undefined {
+	const effort = options.providerOptions?.anthropic?.effort;
+	if (typeof effort !== 'string') return undefined;
+	return EFFORT_LEVELS.find(level => level === effort);
+}
+
+/**
+ * Applies a mid-session effort change through the CLI's flag-settings overlay (`null` resets
+ * to the model default). Runs with the lease held and behind the tool-list barrier, before any
+ * tool result is resolved, so it lands on the turn about to start. A change that fails or
+ * takes longer than `EFFORT_TIMEOUT_MS` is dropped for this request only: the answer still
+ * goes out at the effort the session already had.
+ */
+async function updateEffort(session: Session, requested: EffortLevel | undefined): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			session.handle!.applyFlagSettings({effortLevel: requested ?? null}),
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`applyFlagSettings did not finish within ${EFFORT_TIMEOUT_MS}ms`)),
+					EFFORT_TIMEOUT_MS,
+				);
+				timer.unref?.();
+			}),
+		]);
+		session.effort = requested;
+		debug('effort', `#${session.id}`, 'applyFlagSettings', JSON.stringify({effortLevel: requested ?? null}));
+	} catch (error) {
+		debug('effort update failed', `#${session.id}`, error);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 /** Refresh while leased, before resolving any result that could let the CLI call the API. */
 async function updateTools(session: Session, tools: FunctionTool[], signal: AbortSignal | undefined): Promise<void> {
 	const catalog = session.mcp;
@@ -481,6 +527,7 @@ function createSession(
 	tools: FunctionTool[],
 	signature: string,
 	ephemeral: boolean,
+	effort: EffortLevel | undefined,
 ): Session {
 	enforceSessionCap();
 	const publishedTools = toolMap(tools);
@@ -489,6 +536,7 @@ function createSession(
 		modelId,
 		signature,
 		ephemeral,
+		effort,
 		state: 'idle',
 		lease: undefined,
 		turn: undefined,
@@ -521,11 +569,16 @@ function createSession(
 		prompt: session.input as never,
 		options: {
 			model: modelId,
+			...(effort ? {effort} : {}),
 			cwd: process.cwd(),
 			abortController,
 			mcpServers,
 			tools: [] as never,
 			settingSources: [],
+			// `env` replaces the subprocess environment (it is not merged), so spread it. The
+			// host owns the transcript and compacts it itself, so CLI-side auto-compaction
+			// would only add a summarization call and diverge from the host's history.
+			env: {...process.env, DISABLE_AUTO_COMPACT: '1'},
 			strictMcpConfig: true,
 			persistSession: false,
 			includePartialMessages: true,
@@ -542,7 +595,14 @@ function createSession(
 
 	session.handle = handle;
 	sessions.add(session);
-	debug('session created', `#${session.id}`, modelId, ephemeral ? '(ephemeral)' : '', tools.map(tool => tool.name));
+	debug(
+		'session created',
+		`#${session.id}`,
+		modelId,
+		ephemeral ? '(ephemeral)' : '',
+		effort ? `effort=${effort}` : 'effort=model default',
+		tools.map(tool => tool.name),
+	);
 	void pumpSession(session, handle as AsyncIterable<SdkMessage>);
 	return session;
 }
@@ -1065,7 +1125,6 @@ function requestWarnings(options: LanguageModelV3CallOptions): Array<{type: 'uns
 		['stopSequences', options.stopSequences],
 		['presencePenalty', options.presencePenalty],
 		['frequencyPenalty', options.frequencyPenalty],
-		['maxOutputTokens', options.maxOutputTokens],
 	];
 	for (const [feature, value] of unsupported) {
 		if (value === undefined) continue;
@@ -1155,6 +1214,10 @@ async function streamFor(
 				await updateTools(session, tools, signal);
 				if (signal?.aborted) throw abortReason(signal);
 				if (session.lease !== lease) throw new Error('The session ended while its tool list was being refreshed.');
+				const effort = requestedEffort(options);
+				if (effort !== session.effort) await updateEffort(session, effort);
+				if (signal?.aborted) throw abortReason(signal);
+				if (session.lease !== lease) throw new Error('The session ended while its effort was being updated.');
 				continueSession(session, plan, options.prompt, incoming);
 				return {stream};
 			} catch (error) {
@@ -1174,7 +1237,7 @@ async function streamFor(
 	const ephemeral = tools.length === 0 || sideQuestion;
 	const initial = initialContent(options.prompt, incoming);
 	if (!initial) throw new Error('The prompt has no user message to send to Claude.');
-	const session = createSession(sdkModelId, system, tools, signature, ephemeral);
+	const session = createSession(sdkModelId, system, tools, signature, ephemeral, requestedEffort(options));
 	const lease = attachLease(session);
 	if (initial.replay) debug('replay transcript', `#${session.id}`, incoming.length, 'entries');
 	session.record = recordEntries(incoming);

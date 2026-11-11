@@ -21,10 +21,12 @@ straight to the Agent SDK — no HTTP wire and no server.
 The adapter:
 
 1. Runs each conversation in a long-lived Agent SDK session, with the harness's system
-   prompt, no built-in Claude Code tools (`tools: []`), no settings sources, no CLAUDE.md, and
-   `verbatimPrompts: true` so Claude Code adds none of its own per-turn context (skill lists,
-   reminders, nested memory files). The host passes no thread id, so a request finds its
-   session by transcript (see 6).
+   prompt, no built-in Claude Code tools (`tools: []`), no settings sources, and
+   `verbatimPrompts: true`, which skips the CLI's turn-start attachment pass: no `@path` or
+   slash-command expansion, and no turn-start CLAUDE.md, skill or tool listings, or reminders.
+   The pass the CLI runs between tool calls still runs, but with `settingSources: []` there is
+   little left for it to add. The host passes no thread id, so a request finds its session by
+   transcript (see 6).
 2. Publishes the harness's tools to the SDK as an in-process MCP server, so the model sees
    exactly the tools Command Code offered — with their raw JSON schemas, without a zod
    conversion or tool-argument validation. Command Code owns argument validation; MCP still
@@ -44,6 +46,13 @@ The adapter:
    transcript is replayed as **one** message (user images stay images), matching OpenCode's
    Claude Agent provider. An edited turn, a compaction, or a model switch therefore costs one
    replay; the session that no longer matches is reaped later.
+7. Applies the reasoning effort picked in `/model`: the SDK's `effort` option when the
+   session starts, `applyFlagSettings` when it changes mid-session (`null` resets the CLI to
+   the model default, and a failed or slow update is dropped for that request only). The host
+   sends nothing for both "no effort" and "off", so absence leaves the model default alone.
+   Claude Code's own auto-compaction is disabled (`DISABLE_AUTO_COMPACT=1`): Command Code owns
+   the transcript and compacts it itself, so a CLI-side compaction would only add an extra
+   summarization call and diverge from the host's history.
 
 Reliability rules layered on top:
 
@@ -149,9 +158,9 @@ timeout events to stderr. Other knobs:
 | `CLAUDE_AGENT_MOD_IDLE_MS` | `7200000` | Idle time before a session is closed |
 | `CLAUDE_AGENT_MOD_MAX_SESSIONS` | `6` | Soft cap on live sessions |
 
-Requests carrying `temperature`, `topP`, `topK`, `stopSequences`, penalties, or
-`maxOutputTokens` are accepted but reported through AI SDK warnings — the Agent SDK has no
-per-request way to apply them.
+Requests carrying `temperature`, `topP`, `topK`, `stopSequences`, or penalties are accepted
+but reported through AI SDK warnings — the Agent SDK has no per-request way to apply them.
+`maxOutputTokens` is ignored: Claude Code manages output length.
 
 ## Known limitations
 

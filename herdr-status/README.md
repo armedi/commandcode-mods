@@ -35,17 +35,59 @@ Text is stripped of control characters and capped at 2000 characters before base
 
 ## Install
 
-This mod lives in the [`commandcode-mods`](../) repo as `herdr-status/`.
+This mod lives in [`armedi/commandcode-mods`](https://github.com/armedi/commandcode-mods) as
+`herdr-status/`.
 
 ```bash
-# install the whole mods repo (herdr-status + claude-agent)
-cmd mods add /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods
+# install the whole mods repo (herdr-status + claude-agent), for your user
+cmd mods add -g armedi/commandcode-mods
 
-# or install just this mod
-cmd mods add /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods/herdr-status
+# pin a branch or tag
+cmd mods add -g armedi/commandcode-mods@main
+```
 
-# or try it without installing
-cmd --mod /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods/herdr-status/herdr-status.ts
+Drop `-g` to install into the current project instead of your user settings.
+
+### Install only this mod
+
+`cmd mods add` takes a repo, an npm name, or a local path — not a subdirectory of a repo
+(`.../commandcode-mods/herdr-status` fails to clone). Use one of these instead.
+
+Turn the other mod off after installing the repo:
+
+```bash
+cmd mods add -g armedi/commandcode-mods
+cmd mods disable claude-agent -g
+```
+
+Or load only this mod's file from the repo. There is no flag for it, so the filter goes in
+`mods.sources` — `~/.commandcode/settings.json` for your user, or the project's
+`.commandcode/settings.json` (project settings load once you start Command Code there):
+
+```json
+{
+  "mods": {
+    "sources": [
+      {"source": "armedi/commandcode-mods", "mods": ["herdr-status/*.ts"]}
+    ]
+  }
+}
+```
+
+Then install it:
+
+```bash
+cmd mods update
+```
+
+### Try it without installing
+
+`--mod` takes a local path, not a git URL, so clone first:
+
+```bash
+git clone https://github.com/armedi/commandcode-mods.git
+cd commandcode-mods
+cmd --mod ./herdr-status
 ```
 
 Changes apply on the next session or after `/reload`.

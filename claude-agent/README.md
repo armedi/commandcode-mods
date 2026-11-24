@@ -104,21 +104,69 @@ stream to the host.
 ## Requirements
 
 - `claude` logged in on this machine (`claude auth status`).
-- Dependencies installed once from the repo root: `npm install`.
+- npm dependencies are installed automatically into the mod registry by `cmd mods add`. Only a
+  manual clone (the `--mod` route below) needs `npm install`.
 
 ## Install
 
-This mod lives in the [`commandcode-mods`](../) repo as `claude-agent/`.
+This mod lives in [`armedi/commandcode-mods`](https://github.com/armedi/commandcode-mods) as
+`claude-agent/`.
 
 ```bash
-# install the whole mods repo (herdr-status + claude-agent)
-cmd mods add /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods
+# install the whole mods repo (herdr-status + claude-agent), for your user
+cmd mods add -g armedi/commandcode-mods
 
-# or install just this mod (it uses the repo-root node_modules)
-cmd mods add /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods/claude-agent
+# pin a branch or tag
+cmd mods add -g armedi/commandcode-mods@main
+```
 
-# or try it without installing
-cmd --mod /Users/armedi.armedi/repos/github.com/armedi/commandcode-mods/claude-agent/claude-agent.ts
+Drop `-g` to install into the current project instead of your user settings. The package is
+cloned into `.commandcode/mods/.registry/git/github.com/armedi/commandcode-mods` (project) or
+`~/.commandcode/mods/.registry/...` (`-g`), and its npm dependencies are installed there.
+
+### Install only this mod
+
+`cmd mods add` takes a repo, an npm name, or a local path — not a subdirectory of a repo
+(`.../commandcode-mods/claude-agent` fails to clone). Use one of these instead.
+
+Turn the other mod off after installing the repo:
+
+```bash
+cmd mods add -g armedi/commandcode-mods
+cmd mods disable herdr-status -g
+```
+
+Or load only this mod's file from the repo. There is no flag for it, so the filter goes in
+`mods.sources` — `~/.commandcode/settings.json` for your user, or the project's
+`.commandcode/settings.json` (project settings load once you start Command Code there):
+
+```json
+{
+  "mods": {
+    "sources": [
+      {"source": "armedi/commandcode-mods", "mods": ["claude-agent/*.ts"]}
+    ]
+  }
+}
+```
+
+Then install it:
+
+```bash
+cmd mods update
+```
+
+The filter matches paths inside the package, so the source stays pinned to the repo and only
+`claude-agent/claude-agent.ts` loads. `cmd mods add` keeps a filtered entry you wrote by hand.
+
+### Try it without installing
+
+`--mod` takes a local path, not a git URL, so clone first:
+
+```bash
+git clone https://github.com/armedi/commandcode-mods.git
+cd commandcode-mods && npm install
+cmd --mod ./claude-agent
 ```
 
 `--mod` and `--model` are separate: `--mod` loads the provider, `--model` picks a model id.
